@@ -1,12 +1,16 @@
 import base64
 import csv
-import hashlib
-import time
 from datetime import datetime, timedelta
+import hashlib
 from io import StringIO
-from typing import Dict, Optional, Union
-
+import logging
+import random
 import requests
+import time
+from typing import Dict, Optional, Union, Any
+from urllib.parse import urlparse
+
+logger = logging.getLogger("system_logger")
 
 
 class irDataClient:
@@ -20,173 +24,457 @@ class irDataClient:
         self.username = username
         self.encoded_password = self._encode_password(username, password)
 
-    def _encode_password(self, username: str, password: str) -> str:
+    @staticmethod
+    def _encode_password(username: str, password: str) -> str:
+        """
+        Encodes a password by hashing it with the username and encoding the result in Base64.
+
+        This function concatenates the password with the lowercase username, hashes the result
+        using SHA-256, and returns the hash encoded in Base64 format.
+
+        Args:
+            username (str): The username associated with the password.
+            password (str): The plaintext password to be encoded.
+
+        Returns:
+            str: The Base64-encoded SHA-256 hash of the combined password and username.
+        """
         initial_hash = hashlib.sha256(
             (password + username.lower()).encode("utf-8")
         ).digest()
 
         return base64.b64encode(initial_hash).decode("utf-8")
 
-    def _login(self) -> str:
+    def _build_url(self, endpoint: str) -> str:
+        """
+        Constructs a full URL by appending an endpoint to the base URL.
+
+        Args:
+            endpoint (str): The API endpoint to append to the base URL.
+
+        Returns:
+            str: The full URL formed by combining the base URL and the endpoint.
+        """
+        return self.base_url + endpoint
+
+    @staticmethod
+    def get_main_url(any_url: str) -> str:
+        """
+        Extracts and returns the main part of a URL (scheme, domain, and path).
+
+        This function parses the input URL and reconstructs it using the scheme,
+        network location (domain), and path, omitting query parameters and fragments.
+
+        Args:
+            any_url (str): The full URL to process.
+
+        Returns:
+            str: The reconstructed URL containing only the scheme, domain, and path.
+        """
+        parsed = urlparse(any_url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    @staticmethod
+    def _calculate_backoff(attempt: int, ratelimit_reset: Optional[str]) -> float:
+        """
+        Calculates the backoff time before retrying a request, based on rate limit reset or exponential backoff.
+
+        If a rate limit reset time is provided, the function calculates the time until that reset
+        (plus a 500ms buffer) and returns it. Otherwise, it uses exponential backoff with jitter
+        as a fallback.
+
+        Args:
+            attempt (int): The current retry attempt count (used for exponential backoff).
+            ratelimit_reset (Optional[str]): A UNIX timestamp (in seconds) indicating when the
+                rate limit resets. If None, exponential backoff is used.
+
+        Returns:
+            float: The number of seconds to wait before retrying, with a minimum of 1 second and
+            a maximum of 60 seconds.
+        """
+        if ratelimit_reset:
+            reset_time = datetime.fromtimestamp(int(ratelimit_reset))
+            delta = reset_time - datetime.now() + timedelta(milliseconds=500)
+            return max(delta.total_seconds(), 1.0)
+        # fallback exponential backoff with jitter
+        return min(2 ** attempt + random.uniform(0, 1), 60)
+
+    def _login(self, retries: int = 3):
+        """
+        Attempts to authenticate the user with the iRacing API, using retries and backoff on failure.
+
+        Sends a POST request with the user's credentials to the authentication endpoint. If the server
+        responds with a rate limit (HTTP 429), it waits for the appropriate time before retrying,
+        using rate-limit headers when available or exponential backoff with jitter as a fallback.
+
+        The method will retry failed logins up to the specified number of attempts.
+
+        Args:
+            retries (int): The number of retry attempts allowed on failure (default is 3).
+
+        Raises:
+            RuntimeError: If authentication fails due to an unexpected response, missing auth code,
+                or after all retries are exhausted.
+        """
+
+        # Prepare headers and login payload
         headers = {"Content-Type": "application/json"}
         data = {"email": self.username, "password": self.encoded_password}
 
-        try:
-            r = self.session.post(
-                "https://members-ng.iracing.com/auth",
-                headers=headers,
-                json=data,
-                timeout=5.0,
-            )
-            if r.status_code == 429:
+        for attempt in range(retries):
+            try:
+                # Send POST request to authentication endpoint
+                r = self.session.post(
+                    "https://members-ng.iracing.com/auth",
+                    headers=headers,
+                    json=data,
+                    timeout=5.0,
+                )
+
+                # Extract rate-limiting headers for backoff calculation
                 ratelimit_reset = r.headers.get("x-ratelimit-reset")
-                if ratelimit_reset:
-                    reset_datetime = datetime.fromtimestamp(int(ratelimit_reset))
-                    delta = (
-                        reset_datetime - datetime.now() + timedelta(milliseconds=500)
-                    )
-                    if not self.silent:
-                        print(f"Rate limited, waiting {delta.total_seconds()} seconds")
-                    if delta.total_seconds() > 0:
-                        time.sleep(delta.total_seconds())
-                return self._login()
-        except requests.Timeout:
-            raise RuntimeError("Login timed out")
-        except requests.ConnectionError:
-            raise RuntimeError("Connection error")
-        else:
-            response_data = r.json()
-            if r.status_code == 200 and response_data.get("authcode"):
-                self.authenticated = True
-                return "Logged in"
-            else:
-                raise RuntimeError("Error from iRacing: ", response_data)
+                ratelimit_remaining = r.headers.get("x-ratelimit-remaining")
+                ratelimit_limit = r.headers.get("x-ratelimit-limit")
 
-    def _build_url(self, endpoint: str) -> str:
-        return self.base_url + endpoint
+                # Log response and rate limit info
+                logger.debug(f"_login: Status: {r.status_code}; reset:{ratelimit_reset}; limit:{ratelimit_limit}; remain:{ratelimit_remaining}")
 
-    def _get_resource_or_link(
-        self, url: str, payload: dict = None
-    ) -> list[Union[Dict, str], bool]:
-        if not self.authenticated:
+                if r.status_code == 429:
+                    # Rate-limited: calculate wait time and retry after sleeping
+                    wait_time = self._calculate_backoff(attempt, ratelimit_reset)
+                    logger.warning(f"Login rate-limited, waiting {wait_time:.2f}s on attempt {attempt + 1}")
+                    time.sleep(wait_time)
+                    continue
+
+                elif r.status_code == 200:
+                    # Successful login: check for auth code
+                    response_data = r.json()
+                    if response_data.get("authcode"):
+                        self.authenticated = True
+                        time.sleep(0.5)  # Brief delay to let session stabilize
+                        return
+                    else:
+                        # Login response missing auth code
+                        raise RuntimeError(f"Auth failure: {response_data}")
+                else:
+                    # Unexpected HTTP status code
+                    raise RuntimeError(f"Login HTTP {r.status_code}")
+
+            except (requests.Timeout, requests.ConnectionError) as e:
+                # Handle network-related exceptions with backoff
+                wait_time = self._calculate_backoff(attempt, None)
+                logger.warning(f"Login attempt {attempt + 1} failed: {e}, retrying in {wait_time:.2f}s")
+                time.sleep(wait_time)
+
+        # All retries exhausted without success
+        raise RuntimeError("Login failed after retries")
+
+    def _robust_get(self, url: str, payload: Optional[dict] = None, retries: int = 3, require_auth: bool = True, context: str = "") -> requests.Response:
+        """
+        Performs a robust HTTP GET request with retry logic, backoff, and optional authentication.
+
+        This method handles transient errors such as timeouts, connection issues, rate limiting (429),
+        and authorization issues (401/403) with retries and exponential backoff. It supports optional
+        re-authentication if a 401 Unauthorized response is encountered and handles rate-limiting
+        headers to determine appropriate wait times.
+
+        Args:
+            url (str): The URL to send the GET request to.
+            payload (Optional[dict]): Optional query parameters to include in the request.
+            retries (int): Maximum number of retry attempts for the request. Default is 3.
+            require_auth (bool): Whether authentication is required before making the request.
+            context (str): Optional context string for logging purposes.
+
+        Returns:
+            requests.Response: The HTTP response object for a successful request (status code 200).
+
+        Raises:
+            RuntimeError: If the request fails after retries, or on repeated authentication or forbidden errors.
+        """
+        # Authenticate if required and not already authenticated
+        if require_auth and not self.authenticated:
             self._login()
-            return self._get_resource_or_link(url, payload=payload)
 
-        r = self.session.get(url, params=payload)
+        attempted_relogin = False  # Flag to prevent multiple re-login attempts
 
-        if r.status_code == 401 and self.authenticated:
-            # unauthorised, likely due to a timeout, retry after a login
-            self.authenticated = False
-            return self._get_resource_or_link(url, payload=payload)
+        for attempt in range(retries):
+            try:
+                # Send GET request with optional query parameters
+                r = self.session.get(url, params=payload)
 
-        if r.status_code == 429:
-            ratelimit_reset = r.headers.get("x-ratelimit-reset")
-            if ratelimit_reset:
-                reset_datetime = datetime.fromtimestamp(int(ratelimit_reset))
-                delta = reset_datetime - datetime.now() + timedelta(milliseconds=500)
-                if not self.silent:
-                    print(f"Rate limited, waiting {delta.total_seconds()} seconds")
-                if delta.total_seconds() > 0:
-                    time.sleep(delta.total_seconds())
-            return self._get_resource_or_link(url, payload=payload)
+                # Extract rate-limiting headers for logging and backoff handling
+                ratelimit_reset = r.headers.get("x-ratelimit-reset")
+                ratelimit_remaining = r.headers.get("x-ratelimit-remaining")
+                ratelimit_limit = r.headers.get("x-ratelimit-limit")
 
-        if r.status_code != 200:
-            raise RuntimeError("Unhandled Non-200 response", r)
+                # Log response status and rate limit metadata
+                logger.debug(
+                    f"{context or '_robust_get'}: Status: {r.status_code}; "
+                    f"RL_Reset:{ratelimit_reset}; RL_Limit:{ratelimit_limit}; "
+                    f"RL_Remaining:{ratelimit_remaining} for {url}"
+                )
+
+                if r.status_code == 401:
+                    # Handle unauthorized access (e.g. expired token)
+                    if not attempted_relogin:
+                        attempted_relogin = True
+                        self.authenticated = False
+                        logger.warning(f"{context}: 401 Unauthorized — re-authenticating")
+                        self._login()
+                        continue
+                    else:
+                        r.close()
+                        raise RuntimeError(f"{context}: 401 repeated after re-login for {url}")
+
+                if r.status_code == 403:
+                    # Forbidden access — do not retry
+                    r.close()
+                    logger.error(f"{context}: 403 Forbidden for {url}")
+                    raise RuntimeError(f"{context}: 403 Forbidden for {url}")
+
+                if r.status_code == 429:
+                    # Rate-limited — wait and retry with backoff
+                    wait_time = self._calculate_backoff(attempt, ratelimit_reset)
+                    logger.warning(f"{context}: 429 Rate Limited, retrying in {wait_time:.2f}s (attempt {attempt + 1})")
+                    time.sleep(wait_time)
+                    r.close()
+                    continue
+
+                if r.status_code != 200:
+                    # Any other non-200 response — raise error
+                    r.close()
+                    raise RuntimeError(f"{context}: Unhandled Non-200 response {r.status_code} for {url}")
+
+                # Success — return the response
+                return r
+
+            except (requests.Timeout, requests.ConnectionError) as e:
+                # Network-related errors — apply exponential backoff
+                wait_time = self._calculate_backoff(attempt, None)
+                logger.warning(f"{context}: Connection/Timeout error: {e}. Retrying in {wait_time:.1f}s (attempt {attempt + 1}/{retries})")
+                time.sleep(wait_time)
+
+        # All retry attempts exhausted — raise error
+        raise RuntimeError(f"{context}: Exceeded retry attempts for {url}")
+
+    def _get_resource_or_link(self, url: str, payload: dict = None, retries: int = 3) -> tuple[Any, bool] | tuple[list, bool]:
+        """
+        Fetches a resource from a given URL and determines if it contains a direct link or a full data object.
+
+        This method performs a robust GET request and parses the JSON response. If the response is not a list
+        and contains a "link" key, it assumes the response is a redirect or reference and returns the link
+        along with a flag indicating it's a link. Otherwise, it returns the full data and a flag indicating
+        it's not a link.
+
+        Args:
+            url (str): The URL to fetch the resource from.
+            payload (dict, optional): Optional query parameters for the request.
+            retries (int): Number of retry attempts for the GET request. Defaults to 3.
+
+        Returns:
+            list[Union[Dict, str], bool]: A two-element list where the first item is either a dictionary
+            (full resource data) or a string (link), and the second item is a boolean indicating whether
+            the first item is a link (`True`) or a full resource (`False`).
+        """
+        r = self._robust_get(url, payload=payload, retries=retries, context="_get_resource_or_link")
         data = r.json()
-        if not isinstance(data, list) and "link" in data.keys():
-            return [data.get("link"), True]
-        else:
-            return [data, False]
+        if not isinstance(data, list) and "link" in data:
+            return data.get("link"), True
+        return data, False
 
-    def _get_resource(
-        self, endpoint: str, payload: Optional[dict] = None
-    ) -> Optional[Union[list, dict]]:
+    def _get_resource(self, endpoint: str, payload: Optional[dict] = None, retries: int = 3) -> Optional[Union[list, dict]]:
+        """
+        Retrieves a resource from a specified API endpoint, handling linked responses and content types.
+
+        This method builds the full request URL, fetches the resource (or link to a resource), and
+        determines how to handle the response based on the content type. It supports retry logic
+        and parses both JSON and CSV/text responses.
+
+        Args:
+            endpoint (str): The API endpoint to query.
+            payload (Optional[dict]): Optional query parameters to include in the request.
+            retries (int): The number of retry attempts allowed. Defaults to 3.
+
+        Returns:
+            Optional[Union[list, dict]]: Parsed response data if successful (either JSON or CSV),
+            or None if the content type is unsupported or the request fails.
+        """
+        # Construct the full request URL from the endpoint
         request_url = self._build_url(endpoint)
-        resource_obj, is_link = self._get_resource_or_link(request_url, payload=payload)
 
+        # Get the resource or a link to the actual resource
+        resource_obj, is_link = self._get_resource_or_link(request_url, payload=payload, retries=retries)
+
+        # If the response is not a link, return the resource directly
         if not is_link:
             return resource_obj
-        r = self.session.get(resource_obj)
 
-        if r.status_code == 401 and self.authenticated:
-            # Unauthenticated, likely due to a timeout, retry after a login
-            self.authenticated = False
-            self._login()
-            return self._get_resource(endpoint, payload=payload)
+        # If it's a link, fetch the linked resource
+        r = self._robust_get(resource_obj, retries=retries, context="_get_resource (linked resource)")
 
-        if r.status_code == 429:
-            print("Rate limited, waiting")
-            ratelimit_reset = r.headers.get("x-ratelimit-reset")
-            if ratelimit_reset:
-                reset_datetime = datetime.fromtimestamp(int(ratelimit_reset))
-                delta = reset_datetime - datetime.now()
-                if delta.total_seconds() > 0:
-                    time.sleep(delta.total_seconds())
-            return self._get_resource(endpoint, payload=payload)
-
-        if r.status_code != 200:
-            raise RuntimeError("Unhandled Non-200 response", r)
-
-        content_type = r.headers.get("Content-Type")
-
+        # Determine how to handle the response based on content type
+        content_type = r.headers.get("Content-Type", "")
         if "application/json" in content_type:
             return r.json()
-
         elif "text/csv" in content_type or "text/plain" in content_type:
             return self._parse_csv_response(r.text)
-
         else:
-            print("Error: Unsupported Content-Type")
+            # Unsupported content type encountered
+            logger.error(f"_get_resource: Unsupported Content-Type {content_type} for {r.url}")
             return None
 
     def _get_chunks(self, chunks) -> list:
+        """
+        Retrieves and combines JSON data from a list of chunked file URLs.
+
+        This method expects a dictionary containing a base download URL and a list of chunk file names.
+        It fetches each chunk via HTTP GET, assumes the content is JSON, and flattens the combined
+        results into a single list.
+
+        Args:
+            chunks: A dictionary with keys 'base_download_url' (str) and 'chunk_file_names' (list of str),
+                    or any other type that will be treated as empty.
+
+        Returns:
+            list: A flattened list containing combined data from all retrieved chunks. If the input is not
+                  a dictionary, an empty list is returned.
+        """
         if not isinstance(chunks, dict):
-            # if there are no chunks, return an empty list for compatibility
+            # If chunks is not a dictionary, return empty list for compatibility
             return []
+
+        # Extract the base URL for downloading chunks
         base_url = chunks.get("base_download_url")
+
+        # Build full URLs for each chunk file
         urls = [base_url + x for x in chunks.get("chunk_file_names")]
+
+        # Fetch and parse each chunk file as JSON
         list_of_chunks = [self.session.get(url).json() for url in urls]
+
+        # Flatten the list of lists into a single list of items
         output = [item for sublist in list_of_chunks for item in sublist]
 
         return output
 
-    def _add_assets(self, objects: list, assets: dict, id_key: str) -> list:
+    @staticmethod
+    def _add_assets(objects: list, assets: dict, id_key: str) -> list:
+        """
+        Enriches a list of objects with additional asset data based on a matching ID key.
+
+        For each object in the input list, this method looks up its ID in the `assets` dictionary
+        and merges the corresponding asset fields into the object.
+
+        Args:
+            objects (list): A list of dictionaries to enrich with asset data.
+            assets (dict): A dictionary where keys are stringified IDs and values are dictionaries
+                           containing additional data to merge into the objects.
+            id_key (str): The key in each object that holds the ID used to look up its asset data.
+
+        Returns:
+            list: The list of enriched objects with asset data merged in.
+        """
         for obj in objects:
+            # Look up the asset using the object's ID (converted to string)
             a = assets[str(obj[id_key])]
+
+            # Merge asset data into the object
             for key in a.keys():
                 obj[key] = a[key]
+
         return objects
 
-    def _parse_csv_response(self, text: str) -> list:
+    @staticmethod
+    def _parse_csv_response(text: str) -> list[Dict[str, str]]:
+        """
+        Parses a CSV string into a list of dictionaries, using lowercase headers as keys.
+
+        This method reads CSV-formatted text, converts each row into a dictionary where the
+        keys are the lowercase column headers, and returns a list of these dictionaries.
+        It skips rows that do not match the header length and prints a warning for mismatches.
+
+        Args:
+            text (str): The CSV content as a string.
+
+        Returns:
+            list: A list of dictionaries, each representing a row from the CSV.
+        """
         csv_data = []
+
+        # Initialize CSV reader with comma delimiter
         reader = csv.reader(StringIO(text), delimiter=",")
 
+        # Read and normalize headers (convert to lowercase)
         headers = [header.lower() for header in next(reader)]
 
+        # Process each row, mapping values to headers
         for row in reader:
             if len(row) == len(headers):
                 csv_data.append(dict(zip(headers, row)))
             else:
+                # Handle mismatched row lengths
                 print("Warning: Row length does not match headers length")
 
         return csv_data
 
     @property
     def cars(self) -> list[Dict]:
+        """
+        Retrieves the list of cars with associated asset data merged in.
+
+        This property fetches raw car data and their corresponding asset details,
+        then enriches each car object with its related assets by matching on 'car_id'.
+
+        Returns:
+            list[Dict]: A list of car dictionaries with asset data included.
+        """
+        # Fetch raw car data
         cars = self.get_cars()
+
+        # Fetch asset data related to each car
         car_assets = self.get_cars_assets()
+
+        # Enrich car data with assets based on 'car_id'
         return self._add_assets(cars, car_assets, "car_id")
 
     @property
     def tracks(self) -> list[Dict]:
+        """
+        Retrieves the list of tracks with associated asset data merged in.
+
+        This property fetches raw track data and their corresponding asset details,
+        then enriches each track object by merging the assets using 'track_id' as the key.
+
+        Returns:
+            list[Dict]: A list of track dictionaries with asset data included.
+        """
+        # Fetch raw track data
         tracks = self.get_tracks()
+
+        # Fetch asset data for tracks
         track_assets = self.get_tracks_assets()
+
+        # Merge asset data into track objects using 'track_id'
         return self._add_assets(tracks, track_assets, "track_id")
 
     @property
     def series(self) -> list[Dict]:
+        """
+        Retrieves the list of series with associated asset data merged in.
+
+        This property fetches raw series data and their corresponding asset details,
+        then enriches each series object by merging the assets using 'series_id' as the key.
+
+        Returns:
+            list[Dict]: A list of series dictionaries with asset data included.
+        """
+        # Fetch raw series data
         series = self.get_series()
+
+        # Fetch asset data for each series
         series_assets = self.get_series_assets()
+
+        # Merge asset data into series objects using 'series_id'
         return self._add_assets(series, series_assets, "series_id")
 
     def constants_categories(self) -> list[Dict]:
